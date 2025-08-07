@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/version"
 	"golang.org/x/oauth2/google"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	htransport "google.golang.org/api/transport/http"
@@ -32,6 +34,45 @@ import (
 
 // DirDelim is the delimiter used to model a directory structure in an object store bucket.
 const DirDelim = "/"
+
+// formatGCSETag creates an ETag from GCS generation and metageneration
+func formatGCSETag(generation, metageneration int64) string {
+	return fmt.Sprintf("gen-%d-meta-%d", generation, metageneration)
+}
+
+// parseGCSETag parses a GCS ETag back into generation and metageneration
+func parseGCSETag(etag string) (generation, metageneration int64, err error) {
+	parts := strings.Split(etag, "-")
+	if len(parts) != 4 || parts[0] != "gen" || parts[2] != "meta" {
+		return 0, 0, fmt.Errorf("invalid GCS ETag format: %s", etag)
+	}
+
+	generation, err = strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid generation in ETag %s: %w", etag, err)
+	}
+
+	metageneration, err = strconv.ParseInt(parts[3], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid metageneration in ETag %s: %w", etag, err)
+	}
+
+	return generation, metageneration, nil
+}
+
+// checkConditionalWriteError checks if an error is a conditional write failure
+func checkConditionalWriteError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var gAPIError *googleapi.Error
+	if errors.As(err, &gAPIError) {
+		if gAPIError.Code == http.StatusPreconditionFailed || gAPIError.Code == http.StatusNotModified {
+			return objstore.ErrPreconditionFailed
+		}
+	}
+	return err
+}
 
 var DefaultConfig = Config{
 	HTTPConfig: exthttp.DefaultHTTPConfig,
@@ -312,6 +353,7 @@ func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAt
 	return objstore.ObjectAttributes{
 		Size:         attrs.Size,
 		LastModified: attrs.Updated,
+		ETag:         formatGCSETag(attrs.Generation, attrs.Metageneration),
 	}, nil
 }
 
@@ -333,20 +375,40 @@ func (b *Bucket) Exists(ctx context.Context, name string) (bool, error) {
 
 // Upload writes the file specified in src to remote GCS location specified as target.
 func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader, opts ...objstore.ObjectUploadOption) error {
-	w := b.bkt.Object(name).NewWriter(ctx)
-
 	uploadOpts := objstore.ApplyObjectUploadOptions(opts...)
+
+	obj := b.bkt.Object(name)
+
+	// Set conditional upload options if specified
+	if uploadOpts.IfNotExists {
+		obj = obj.If(storage.Conditions{DoesNotExist: true})
+	} else if uploadOpts.IfMatch != "" {
+		// Parse the ETag to get generation and metageneration
+		generation, metageneration, err := parseGCSETag(uploadOpts.IfMatch)
+		if err != nil {
+			return errors.Wrap(err, "invalid ETag format")
+		}
+		obj = obj.If(storage.Conditions{
+			GenerationMatch:     generation,
+			MetagenerationMatch: metageneration,
+		})
+	}
+
+	w := obj.NewWriter(ctx)
+
 	// if `chunkSize` is 0, we don't set any custom value for writer's ChunkSize.
 	// It uses whatever the default value https://pkg.go.dev/google.golang.org/cloud/storage#Writer
 	if b.chunkSize > 0 {
 		w.ChunkSize = b.chunkSize
+	}
+	if uploadOpts.ContentType != "" {
 		w.ContentType = uploadOpts.ContentType
 	}
 
 	if _, err := io.Copy(w, r); err != nil {
-		return err
+		return checkConditionalWriteError(err)
 	}
-	return w.Close()
+	return checkConditionalWriteError(w.Close())
 }
 
 // Delete removes the object with the given name.

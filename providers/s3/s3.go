@@ -558,26 +558,41 @@ func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader, opts ...o
 
 	uploadOpts := objstore.ApplyObjectUploadOptions(opts...)
 
+	options := minio.PutObjectOptions{
+		DisableMultipart:     b.disableMultipart,
+		PartSize:             partSize,
+		ServerSideEncryption: sse,
+		UserMetadata:         userMetadata,
+		StorageClass:         b.storageClass,
+		SendContentMd5:       b.sendContentMd5,
+		// 4 is what minio-go have as the default. To be certain we do micro benchmark before any changes we
+		// ensure we pin this number to four.
+		// TODO(bwplotka): Consider adjusting this number to GOMAXPROCS or to expose this in config if it becomes bottleneck.
+		NumThreads:  4,
+		ContentType: uploadOpts.ContentType,
+	}
+
+	if uploadOpts.IfNotExists {
+		options.SetMatchETagExcept("*")
+	}
+	if uploadOpts.IfMatch != "" {
+		options.SetMatchETag(uploadOpts.IfMatch)
+	}
+
 	if _, err := b.client.PutObject(
 		ctx,
 		b.name,
 		name,
 		r,
 		size,
-		minio.PutObjectOptions{
-			DisableMultipart:     b.disableMultipart,
-			PartSize:             partSize,
-			ServerSideEncryption: sse,
-			UserMetadata:         userMetadata,
-			StorageClass:         b.storageClass,
-			SendContentMd5:       b.sendContentMd5,
-			// 4 is what minio-go have as the default. To be certain we do micro benchmark before any changes we
-			// ensure we pin this number to four.
-			// TODO(bwplotka): Consider adjusting this number to GOMAXPROCS or to expose this in config if it becomes bottleneck.
-			NumThreads:  4,
-			ContentType: uploadOpts.ContentType,
-		},
+		options,
 	); err != nil {
+		if minio.ToErrorResponse(err).Code == "PreconditionFailed" {
+			return fmt.Errorf("%w: %w", objstore.ErrPreconditionFailed, err)
+		}
+		if cause := errors.Cause(err); cause != nil && minio.ToErrorResponse(cause).Code == "PreconditionFailed" {
+			return fmt.Errorf("%w: %w", objstore.ErrPreconditionFailed, err)
+		}
 		return errors.Wrap(err, "upload s3 object")
 	}
 
