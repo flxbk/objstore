@@ -52,6 +52,10 @@ const (
 	OpAttributes = "attributes"
 )
 
+var (
+	ErrPreconditionFailed = errors.New("precondition failed")
+)
+
 // Bucket provides read and write access to an object storage bucket.
 // NOTE: We assume strong consistency for write-read flow.
 type Bucket interface {
@@ -198,6 +202,8 @@ func ApplyIterOptions(options ...IterOption) IterParams {
 
 type UploadObjectParams struct {
 	ContentType string
+	IfMatch     string // ETag for conditional upload - only upload if blob ETag matches this value
+	IfNotExists bool   // If true, only upload if blob does not exist
 }
 
 type ObjectUploadOption func(f *UploadObjectParams)
@@ -205,6 +211,18 @@ type ObjectUploadOption func(f *UploadObjectParams)
 func WithContentType(contentType string) ObjectUploadOption {
 	return func(f *UploadObjectParams) {
 		f.ContentType = contentType
+	}
+}
+
+func WithIfMatch(etag string) ObjectUploadOption {
+	return func(f *UploadObjectParams) {
+		f.IfMatch = etag
+	}
+}
+
+func WithIfNotExists() ObjectUploadOption {
+	return func(f *UploadObjectParams) {
+		f.IfNotExists = true
 	}
 }
 
@@ -280,6 +298,9 @@ type ObjectAttributes struct {
 
 	// LastModified is the timestamp the object was last modified.
 	LastModified time.Time `json:"last_modified"`
+
+	// ETag is the entity tag for the object.
+	ETag string `json:"etag"`
 }
 
 type IterObjectAttributes struct {

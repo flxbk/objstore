@@ -5,6 +5,7 @@ package filesystem
 
 import (
 	"context"
+	"crypto/md5"
 	"fmt"
 	"io"
 	"os"
@@ -48,6 +49,22 @@ func NewBucket(rootDir string) (*Bucket, error) {
 		return nil, err
 	}
 	return &Bucket{rootDir: absDir}, nil
+}
+
+func etagForFile(f *os.File) (string, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	hash := md5.New()
+	// Generate ETag from file size and modification time
+	if _, err := io.Copy(hash, f); err != nil {
+		return "", err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	etag := fmt.Sprintf(`"%x"`, hash.Sum(nil))
+	return etag, nil
 }
 
 func (b *Bucket) Provider() objstore.ObjProvider { return objstore.FILESYSTEM }
@@ -171,9 +188,22 @@ func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAt
 		return objstore.ObjectAttributes{}, errors.Wrapf(err, "stat %s", file)
 	}
 
+	// Generate ETag by reading the file
+	f, err := os.Open(file)
+	if err != nil {
+		return objstore.ObjectAttributes{}, errors.Wrapf(err, "open %s", file)
+	}
+	defer f.Close()
+
+	etag, err := etagForFile(f)
+	if err != nil {
+		return objstore.ObjectAttributes{}, errors.Wrapf(err, "generate etag for %s", file)
+	}
+
 	return objstore.ObjectAttributes{
 		Size:         stat.Size(),
 		LastModified: stat.ModTime(),
+		ETag:         etag,
 	}, nil
 }
 
@@ -247,12 +277,42 @@ func (b *Bucket) Exists(ctx context.Context, name string) (bool, error) {
 }
 
 // Upload writes the file specified in src to into the memory.
-func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader, _ ...objstore.ObjectUploadOption) (err error) {
+func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader, uploadOpts ...objstore.ObjectUploadOption) (err error) {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 
+	uploadOptions := objstore.ApplyObjectUploadOptions(uploadOpts...)
 	file := filepath.Join(b.rootDir, name)
+
+	// Check conditional upload options
+	if uploadOptions.IfNotExists || uploadOptions.IfMatch != "" {
+		exists, err := b.Exists(ctx, name)
+		if err != nil {
+			return err
+		}
+
+		if uploadOptions.IfNotExists && exists {
+			return objstore.ErrPreconditionFailed
+		}
+
+		if uploadOptions.IfMatch != "" {
+			if !exists {
+				return objstore.ErrPreconditionFailed
+			}
+
+			// Get current ETag to compare
+			attrs, err := b.Attributes(ctx, name)
+			if err != nil {
+				return err
+			}
+
+			if attrs.ETag != uploadOptions.IfMatch {
+				return objstore.ErrPreconditionFailed
+			}
+		}
+	}
+
 	if err := os.MkdirAll(filepath.Dir(file), os.ModePerm); err != nil {
 		return err
 	}
