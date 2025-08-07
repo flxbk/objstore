@@ -576,7 +576,11 @@ func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader, opts ...o
 		options.SetMatchETagExcept("*")
 	}
 	if uploadOpts.IfMatch != "" {
-		options.SetMatchETag(uploadOpts.IfMatch)
+		unquotedIfMatch, err := strconv.Unquote(uploadOpts.IfMatch)
+		if err != nil {
+			return err
+		}
+		options.SetMatchETag(unquotedIfMatch)
 	}
 
 	if _, err := b.client.PutObject(
@@ -616,6 +620,7 @@ func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAt
 	return objstore.ObjectAttributes{
 		Size:         objInfo.Size,
 		LastModified: objInfo.LastModified,
+		ETag:         strconv.Quote(objInfo.ETag),
 	}, nil
 }
 
