@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
@@ -348,6 +349,7 @@ func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAt
 	return objstore.ObjectAttributes{
 		Size:         *resp.ContentLength,
 		LastModified: *resp.LastModified,
+		ETag:         string(*resp.ETag),
 	}, nil
 }
 
@@ -377,7 +379,37 @@ func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader, uploadOpt
 			BlobContentType: &uploadOptions.ContentType,
 		},
 	}
+
+	// Set conditional upload options if specified
+	if uploadOptions.IfMatch != "" || uploadOptions.IfNotExists {
+		var modifiedAccessConditions *blob.ModifiedAccessConditions
+
+		if uploadOptions.IfMatch != "" {
+			etag := azcore.ETag(uploadOptions.IfMatch)
+			modifiedAccessConditions = &blob.ModifiedAccessConditions{
+				IfMatch: &etag,
+			}
+		}
+
+		if uploadOptions.IfNotExists {
+			etag := azcore.ETagAny
+			if modifiedAccessConditions == nil {
+				modifiedAccessConditions = &blob.ModifiedAccessConditions{}
+			}
+			modifiedAccessConditions.IfNoneMatch = &etag
+		}
+
+		opts.AccessConditions = &blob.AccessConditions{
+			ModifiedAccessConditions: modifiedAccessConditions,
+		}
+	}
+
 	if _, err := blobClient.UploadStream(ctx, r, opts); err != nil {
+		// Check if it's a conditional write failure
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && (respErr.StatusCode == http.StatusPreconditionFailed || respErr.StatusCode == http.StatusConflict) {
+			return objstore.ErrPreconditionFailed
+		}
 		return errors.Wrapf(err, "cannot upload Azure blob, address: %s", name)
 	}
 	return nil
